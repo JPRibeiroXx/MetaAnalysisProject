@@ -1,0 +1,15 @@
+# Ignore JSON files folder
+json_files/
+
+# Ignore images folder
+images/
+
+# Ignore exported dataframes folder
+exported_dfs/
+
+# Ignore Python cache folder
+__pycache__/
+
+# Ignore system-specific files
+.DS_Store
+.idea/
