@@ -21,6 +21,7 @@ Whether you are compiling sources for a thesis, conducting a meta-analysis, or j
 ### 1. Clone the repository:
 ```bash
 git clone https://github.com/JPRibeiroXx/MetaAnalysisProject.git
+cd MetaAnalysisProject
 ```
 
 ### 2. Install the required dependencies:
@@ -28,13 +29,54 @@ git clone https://github.com/JPRibeiroXx/MetaAnalysisProject.git
 pip install -r requirements.txt
 ```
 
-### 3. Run the scraper:
-- Follow the prompts to input your search queries and customize your scraping options.
-- Once completed, the papers will be saved in the format of your choice.
+---
 
-### 4. Example Usage:
+## Cardiac Aging Review — Quick Start
+
+**Review title:** *Age as a design variable: building cardiac models that predict clinical outcomes*
+
+### Step 1 — Scrape PubMed
+
+Runs 5 pre-defined boolean queries year-by-year (avoids the 10 000-record cap).
+Results are saved as JSONL into `./json_files/`.
+
 ```bash
-python scraper.py --query "machine learning" --export-format json
+python3 scripts/run_review_pubmed_search.py --start-year 2000 --end-year 2027 --increment 1
+```
+
+Optional flags:
+```
+--start-year INT   First year to include (default: 2000)
+--end-year   INT   Exclusive upper bound, e.g. 2027 to include 2026 (default: 2027)
+--increment  INT   Year chunk size (default: 1)
+--outdir     PATH  Where to write JSONL files (default: ./json_files)
+```
+
+### Step 2 — Build master screening table
+
+Loads all JSONL files, deduplicates (PMID > DOI > normalized title), applies
+boolean screening tags, and exports CSVs + XLSX.
+
+```bash
+python3 scripts/build_review_master_table.py
+```
+
+Outputs in `./exported_dfs/`:
+| File | Contents |
+|------|----------|
+| `review_master.csv` | All deduplicated records + tags |
+| `review_screening.csv` | `keep_for_manual_screening == True` subset |
+| `review_screening.xlsx` | Same, formatted for manual curation |
+
+**Screening logic:**
+```
+keep = tag_model AND tag_age AND (tag_endpoint OR tag_drug OR tag_knob)
+```
+
+Optional flags:
+```
+--json-dir PATH   JSONL source directory (default: ./json_files)
+--out-dir  PATH   Output directory (default: ./exported_dfs)
 ```
 
 ## Installation

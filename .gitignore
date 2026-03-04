@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Data outputs (large / generated)
+json_files/
+exported_dfs/
+images/
+/tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.cursor/
+*.swp

@@ -1,4 +1,5 @@
 from paperscraper.pubmed import get_and_dump_pubmed_papers
+import os
 import re
 
 class PubMedScraper:
@@ -39,17 +40,18 @@ class PubMedScraper:
                 raise ValueError("Increment value must be greater than zero.")
        
         
-            # Generate queries for each year in the date range
+            # Generate queries for each year in the date range.
+            # Date clause must NOT be quoted: PubMed expects (YYYY:YYYY[dp])
             if increment > 1:
-                for dates in range (start_year,end_year,increment):
+                for dates in range(start_year, end_year, increment):
                     for key, value in self.search_terms.items():
-                        date_dates = [f'"{dates}:{dates+increment-1}[dp]"']
-                        queries[f'{key}_{dates}_{dates+increment-1}'] = [[value,date_dates]]
-            else:    
-                for dates in range (start_year,end_year,1):
+                        date_dates = [f'{dates}:{dates+increment-1}[dp]']
+                        queries[f'{key}_{dates}_{dates+increment-1}'] = [[value, date_dates]]
+            else:
+                for dates in range(start_year, end_year, 1):
                     for key, value in self.search_terms.items():
-                        date_dates = [f'"{dates}:{dates}[dp]"']
-                        queries[f'{key}_{dates}'] = [[value,date_dates]]
+                        date_dates = [f'{dates}:{dates}[dp]']
+                        queries[f'{key}_{dates}'] = [[value, date_dates]]
         except Exception as e:
                print(f"An error occurred while generating queries: {e}")  
                
@@ -78,27 +80,29 @@ class PubMedScraper:
             print(f"An error occurred while generating search strings: {e}")
         return None
     
-    def scrape_pubmed(self):
+    def scrape_pubmed(self, output_dir: str = './json_files'):
         """
         Scrape PubMed for papers based on the generated queries.
-        
+
         Args:
             self.queries (dict): A dictionary containing the generated queries.
+            output_dir (str): Directory where JSONL files will be saved. Defaults to './json_files'.
         """
-        
+
         def sanitize_filename(filename):
-            # Remove any characters that are not alphanumeric or underscores
             return re.sub(r'[^\w]', '_', filename)
-        
+
         try:
             if not self.queries:
                 raise ValueError("No queries generated. Please generate queries before scraping PubMed.")
 
+            os.makedirs(output_dir, exist_ok=True)
+
             for query_name, query_list in self.queries.items():
-                # Sanitize the query_name for use in the file path
                 sanitized_query_name = sanitize_filename(query_name)
                 for query in query_list:
-                    get_and_dump_pubmed_papers(query, output_filepath=f'./json_files/{sanitized_query_name}_PubMed.jsonl')
+                    out_path = os.path.join(output_dir, f'{sanitized_query_name}_PubMed.jsonl')
+                    get_and_dump_pubmed_papers(query, output_filepath=out_path)
             print('Done!')
         except Exception as e:
             print(f"An error occurred while scraping PubMed: {e}")
