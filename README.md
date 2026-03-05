@@ -58,6 +58,34 @@ pip install -r requirements.txt
 
 ## Run the GUI
 
+### One-command helpers
+
+- **macOS / Linux** (from repo root):
+
+```bash
+./run_local_macos.sh
+```
+
+- **Windows (PowerShell)**:
+
+```powershell
+.\run_local_windows.ps1
+```
+
+- **Windows (CMD)**:
+
+```bat
+run_local_windows.bat
+```
+
+These scripts will:
+
+- create `.venv` if it does not exist,
+- install / update dependencies from `requirements.txt`,
+- launch Streamlit on `http://localhost:8501`.
+
+### Manual run (optional)
+
 ```bash
 # macOS / Linux
 source .venv/bin/activate
@@ -67,8 +95,6 @@ streamlit run app.py
 .venv\Scripts\activate
 streamlit run app.py
 ```
-
-Opens at `http://localhost:8501`.
 
 ---
 
