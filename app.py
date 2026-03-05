@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import unicodedata
+import uuid
 from io import BytesIO
 
 import matplotlib
@@ -27,8 +28,11 @@ JSON_DIR = os.path.join(ROOT, "json_files")
 EXPORTED = os.path.join(ROOT, "exported_dfs")
 IMAGES = os.path.join(ROOT, "images")
 
-# Import canonical query definitions from the CLI script (single source of truth)
 sys.path.insert(0, ROOT)
+from utils.gui_utils import (  # noqa: E402
+    suggest_pattern, build_query_preview,
+    get_term_suggestions, fetch_mesh_terms, apply_pending_term,
+)
 from scripts.run_review_pubmed_search import SEARCH_TERMS as _SEARCH_TERMS  # noqa: E402
 
 # Flatten from {key: [string]} → {key: string} for the GUI table
@@ -66,6 +70,21 @@ DEFAULT_TAGS = pd.DataFrame([
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_mesh_terms(query: str, scope: str) -> list[str]:
+    """Fetch MeSH terms from NLM API (cached 1h) then merge with local tiab suggestions."""
+    mesh = fetch_mesh_terms(query, max_results=6)
+    local = get_term_suggestions(query, scope=scope)
+    # Interleave: MeSH first, then tiab — deduplicated
+    seen: set[str] = set()
+    merged: list[str] = []
+    for t in mesh + local:
+        if t not in seen:
+            seen.add(t)
+            merged.append(t)
+    return merged[:12]  # cap at 12 chips
+
+
 def normalize_title(t):
     if not isinstance(t, str):
         return ""
@@ -156,97 +175,145 @@ with tab_scrape:
 
     # ── Visual Query Builder ──────────────────────────────────────────────────
     st.divider()
-    with st.expander("Visual Query Builder — build a new query from concept blocks"):
+    with st.expander("Visual Query Builder — compose a query from concept blocks"):
         st.markdown(
-            "Build a PubMed boolean query by composing **concept blocks**. "
-            "Terms within a block are **OR**'d together; blocks are connected "
-            "by the connector you choose (**AND** / **OR**). "
-            "The generated query is added to the table above."
+            "Each **block** is a concept (its terms are OR'd). "
+            "Blocks are joined top-to-bottom by the **connector** you choose. "
+            "Move blocks up/down with the arrow buttons. "
+            "When you're happy, click **Add to query table** above."
         )
 
-        # Represent blocks as a data_editor table
-        # Columns: Block Name | Terms (one per line, OR'd) | Connect to NEXT block
-        if "builder_df" not in st.session_state:
-            st.session_state.builder_df = pd.DataFrame([
-                {
-                    "Block Name": "Cardiac models",
-                    "Terms (one per line — will be OR'd)": (
-                        '"engineered heart tissue"[Title/Abstract]\n'
-                        'hiPSC-CM[Title/Abstract]\n'
-                        '"heart-on-a-chip"[Title/Abstract]\n'
-                        'MPS[Title/Abstract]\n'
-                        '"organ-on-a-chip"[Title/Abstract]'
-                    ),
-                    "Connect to next block": "AND",
-                },
-                {
-                    "Block Name": "Age / maturation",
-                    "Terms (one per line — will be OR'd)": (
-                        "aging[Title/Abstract]\n"
-                        "senescence[Title/Abstract]\n"
-                        "maturation[Title/Abstract]\n"
-                        '"adult-like"[Title/Abstract]'
-                    ),
-                    "Connect to next block": "—",
-                },
-            ])
+        # Each block has a stable UUID so widget keys survive reorder/delete
+        def _make_block(name="", terms="", connector="AND"):
+            return {"id": str(uuid.uuid4()), "name": name, "terms": terms, "connector": connector}
 
-        bc1, bc2 = st.columns([4, 1])
-        with bc1:
-            builder_edited = st.data_editor(
-                st.session_state.builder_df,
-                use_container_width=True,
-                num_rows="dynamic",
-                column_config={
-                    "Block Name": st.column_config.TextColumn("Block Name", width="small"),
-                    "Terms (one per line — will be OR'd)": st.column_config.TextColumn(
-                        "Terms (one per line — will be OR'd)",
-                        width="large",
-                        help="Each line becomes one OR-term. Use PubMed field tags like [Title/Abstract].",
-                    ),
-                    "Connect to next block": st.column_config.SelectboxColumn(
-                        "↕ Connector to next",
-                        options=["AND", "OR", "—"],
-                        width="small",
-                        help="AND = both blocks required. OR = either block. '—' = last block (ignored).",
-                    ),
-                },
-                key="builder_editor",
-            )
-        st.session_state.builder_df = builder_edited
+        _DEFAULT_BLOCKS = [
+            _make_block("Cardiac models",
+                        '"engineered heart tissue"[tiab]\nhiPSC-CM[tiab]\n"heart-on-a-chip"[tiab]\nMPS[tiab]\n"organ-on-a-chip"[tiab]',
+                        "AND"),
+            _make_block("Age / maturation",
+                        'aging[tiab]\nsenescence[tiab]\nmaturation[tiab]\n"adult-like"[tiab]',
+                        "AND"),
+        ]
 
-        with bc2:
-            st.markdown("&nbsp;")  # spacer
-            new_query_name = st.text_input("New query name", value="MY_QUERY",
-                                           help="Will be added to the query table above")
+        if "qb_blocks" not in st.session_state:
+            st.session_state.qb_blocks = _DEFAULT_BLOCKS[:]
 
-        # Build preview
-        def _build_preview(df: pd.DataFrame) -> str:
-            parts = []
-            connectors = []
-            for _, row in df.iterrows():
-                raw = row["Terms (one per line — will be OR'd)"]
-                terms = [t.strip() for t in str(raw).splitlines() if t.strip()]
-                if not terms:
-                    continue
-                block_str = "(" + " OR ".join(terms) + ")"
-                parts.append(block_str)
-                conn = str(row.get("Connect to next block", "AND")).strip()
-                connectors.append(conn if conn not in ("—", "", "None") else None)
+        blocks = st.session_state.qb_blocks
+        n = len(blocks)
 
-            if not parts:
-                return ""
-            result = parts[0]
-            for i, part in enumerate(parts[1:]):
-                conn = connectors[i] or "AND"
-                result = f"({result} {conn} {part})"
-            return result
+        for idx, block in enumerate(blocks):
+            bid = block["id"]
+            is_last = idx == n - 1
 
-        preview_str = _build_preview(builder_edited)
-        st.markdown("**Preview:**")
-        st.code(preview_str or "(empty — add terms above)", language=None)
+            card_cols = st.columns([0.04, 0.96])
+            with card_cols[0]:
+                if idx > 0 and st.button("^", key=f"qb_up_{bid}", help="Move up"):
+                    blocks[idx - 1], blocks[idx] = blocks[idx], blocks[idx - 1]
+                    st.rerun()
+                if idx < n - 1 and st.button("v", key=f"qb_dn_{bid}", help="Move down"):
+                    blocks[idx], blocks[idx + 1] = blocks[idx + 1], blocks[idx]
+                    st.rerun()
+                if n > 1 and st.button("x", key=f"qb_del_{bid}", help="Delete block"):
+                    blocks.pop(idx)
+                    st.rerun()
 
-        if st.button("Add to query table", disabled=not preview_str or not new_query_name):
+            with card_cols[1]:
+                st.markdown(f"**Block {idx + 1}** — {block['name'] or 'unnamed'}")
+                b_cols = st.columns([2, 5, 2])
+                with b_cols[0]:
+                    block["name"] = st.text_input(
+                        "Block name",
+                        value=block["name"],
+                        key=f"qb_name_{bid}",
+                        label_visibility="collapsed",
+                        placeholder="Block name",
+                    )
+                with b_cols[1]:
+                    # Apply any pending chip addition BEFORE the textarea renders
+                    # so the widget picks up the updated value via the `value` parameter
+                    pending_key = f"qb_pending_{bid}"
+                    terms_key   = f"qb_terms_{bid}"
+                    if pending_key in st.session_state:
+                        term_to_add = st.session_state.pop(pending_key)
+                        block["terms"] = apply_pending_term(block["terms"], term_to_add)
+                        # Remove stale widget state so textarea re-renders with new value
+                        st.session_state.pop(terms_key, None)
+
+                    block["terms"] = st.text_area(
+                        "Terms",
+                        value=block["terms"],
+                        key=terms_key,
+                        height=110,
+                        help="One search term per line — all OR'd together. "
+                             "Use PubMed field tags, e.g. aging[tiab] or \"Aging\"[MeSH Terms]",
+                        label_visibility="collapsed",
+                    )
+
+                    # Suggestion chips: live MeSH lookup + local tiab fallback
+                    _scope = st.session_state.get("search_scope_select", "tiab")
+                    suggestions = _cached_mesh_terms(block["name"], _scope) if block["name"].strip() else []
+                    if suggestions:
+                        st.caption("Suggested terms — click to add:")
+                        chip_cols = st.columns(min(len(suggestions), 4))
+                        for ci, term in enumerate(suggestions[:12]):
+                            with chip_cols[ci % 4]:
+                                short = term.split("[")[0].strip('"').strip()[:26]
+                                if st.button(short, key=f"chip_{bid}_{ci}", help=term):
+                                    st.session_state[pending_key] = term
+                                    st.rerun()
+                with b_cols[2]:
+                    if not is_last:
+                        conn_options = ["AND", "OR", "NOT"]
+                        # Key is stable (UUID-based) so Streamlit persists the chosen value correctly
+                        block["connector"] = st.selectbox(
+                            "Connector",
+                            options=conn_options,
+                            index=conn_options.index(block.get("connector") or "AND"),
+                            key=f"qb_conn_{bid}",
+                            help="How this block connects to the next one",
+                        )
+                    else:
+                        st.caption("(last block)")
+                        block["connector"] = "AND"
+
+            if not is_last:
+                st.markdown(
+                    f"<div style='text-align:center;font-weight:bold;color:#555;"
+                    f"letter-spacing:2px;padding:4px 0'>&mdash; {block.get('connector','AND')} &mdash;</div>",
+                    unsafe_allow_html=True,
+                )
+
+        badd, breset = st.columns([1, 1])
+        with badd:
+            if st.button("+ Add block"):
+                blocks.append(_make_block(f"Block {n + 1}"))
+                st.rerun()
+        with breset:
+            if st.button("Reset builder"):
+                st.session_state.qb_blocks = _DEFAULT_BLOCKS[:]
+                # Clear stale widget state for old block IDs
+                for key in list(st.session_state.keys()):
+                    if key.startswith(("qb_conn_", "qb_name_", "qb_terms_", "qb_up_", "qb_dn_", "qb_del_")):
+                        del st.session_state[key]
+                st.rerun()
+
+        # Build preview using the shared utility
+        _preview_df = pd.DataFrame([
+            {"Block Name": b["name"], "Terms": b["terms"], "Connector": b.get("connector") or "—"}
+            for b in blocks
+        ])
+        preview_str = build_query_preview(_preview_df)
+
+        st.divider()
+        st.markdown("**Query preview:**")
+        st.code(preview_str or "(add terms to the blocks above)", language=None)
+
+        new_query_name = st.text_input(
+            "Name for this query (will be added to the table above)",
+            value="MY_QUERY", key="qb_name_final",
+        )
+        if st.button("Add to query table", disabled=not preview_str or not new_query_name.strip()):
             new_row = pd.DataFrame([{
                 "Query Name": new_query_name.strip().upper().replace(" ", "_"),
                 "Query String (PubMed boolean)": preview_str,
@@ -254,7 +321,7 @@ with tab_scrape:
             st.session_state.query_df = pd.concat(
                 [st.session_state.query_df, new_row], ignore_index=True
             )
-            st.success(f"Added {new_query_name} to the query table. Scroll up to see it.")
+            st.success(f"Added {new_query_name.strip().upper()} to the query table. Scroll up to see it.")
 
     st.divider()
     st.subheader("Year Range & Output")
@@ -267,6 +334,7 @@ with tab_scrape:
             "tw": "Text Word — title, abstract, MeSH, keywords (broader, more hits)",
         }[x],
         index=0,
+        key="search_scope_select",
         help="[tiab] = title + abstract. [tw] = also MeSH terms, author keywords, and other indexed fields.",
     )
 
@@ -288,15 +356,25 @@ with tab_scrape:
             min_value=1,
             max_value=10,
             value=1,
-            help="1 = one file per year (safest, avoids 10 000-record cap)",
+            help="Number of years per API call. 1 = one call per year (safest; PubMed returns max 10,000 results per query, so broad queries need 1). Use 2–5 for narrow queries to speed up.",
         )
     with c4:
         out_dir = st.text_input("Output directory", value="./json_files")
 
+    import math
+    n_queries = max(len(edited_df), 1)
+    n_chunks = max(math.ceil((end_year - start_year + 1) / max(increment, 1)), 1)
+    n_api_calls = n_queries * n_chunks
+    secs_per_call = 3  # conservative estimate; PubMed rate-limits to ~3 req/s
+    est_secs = n_api_calls * secs_per_call
+    est_min = est_secs // 60
+    est_sec_rem = est_secs % 60
+    time_str = f"{est_min}m {est_sec_rem}s" if est_min else f"~{est_secs}s"
     st.info(
-        f"Will run **{len(edited_df)} queries x {end_year - start_year + 1} years "
-        f"= {len(edited_df) * (end_year - start_year + 1)} API calls** "
-        f"(~{len(edited_df) * (end_year - start_year + 1) // 60 + 1} min)."
+        f"{n_queries} quer{'y' if n_queries==1 else 'ies'} "
+        f"× {n_chunks} chunk{'s' if n_chunks!=1 else ''} "
+        f"({start_year}–{end_year}, chunk size {increment}) "
+        f"= **{n_api_calls} API calls** — estimated {time_str}."
     )
 
     if st.button("Run Scrape", type="primary", use_container_width=True):
@@ -326,28 +404,35 @@ with tab_scrape:
         if not os.path.exists(python):
             python = sys.executable
 
-        log_box = st.empty()
-        accumulated = []
-        with st.spinner("Scraping PubMed… this may take several minutes."):
+        n_calls = len(terms_dict) * max(1, (end_year - start_year + 1 + increment - 1) // increment)
+        status_box = st.empty()
+        with st.spinner(f"Scraping PubMed ({n_calls} API calls) — running in background..."):
             proc = subprocess.Popen(
                 [python, tmp_script],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,  # suppress warnings; capture separately for error reporting
                 text=True,
                 cwd=ROOT,
             )
+            # Stream only meaningful stdout lines (query progress), no warnings
+            progress_lines: list[str] = []
             for line in proc.stdout:
-                stripped = line.rstrip()
-                if stripped and not stripped.startswith("WARNING") and not stripped.startswith("/"):
-                    accumulated.append(stripped)
-                    log_box.code("\n".join(accumulated[-40:]), language=None)
+                s = line.rstrip()
+                if s and not any(s.startswith(p) for p in ("WARNING", "/Users", "/opt", "warn")):
+                    progress_lines.append(s)
+                    status_box.caption(progress_lines[-1])
+            stderr_out = proc.stderr.read()
             proc.wait()
 
+        status_box.empty()
         os.remove(tmp_script)
         if proc.returncode == 0:
             st.success("Scrape complete. JSONL files are in `json_files/`.")
         else:
-            st.error("Scraper exited with an error. Check the log above.")
+            # Show stderr only on failure
+            err_lines = [l for l in stderr_out.splitlines()
+                         if l.strip() and not l.startswith("WARNING")]
+            st.error("Scraper exited with an error:\n\n" + "\n".join(err_lines[-20:]))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -408,112 +493,21 @@ with tab_table:
     )
     st.session_state.tags_df = tags_df_edited
 
-    # ── Pattern suggestion engine ──────────────────────────────────────────────
-    _PATTERN_LOOKUP: dict[str, str] = {
-        # Cardiac / cardiovascular
-        "cardiac": "cardiac|heart|myocardial|cardiomyocyte|cardiovascular",
-        "heart": "heart|cardiac|myocardial|cardiovascular",
-        "cardiomyocyte": "cardiomyocyte|hiPSC-CM|iPSC-derived cardiomyocyte|stem cell-derived cardiac",
-        # Tissue / organ models
-        "model": "engineered heart tissue|EHT|heart-on-a-chip|organ-on-a-chip|microphysiological|MPS|organoid|spheroid|3D cardiac",
-        "organoid": "organoid|spheroid|3D culture|self-assembled",
-        "chip": "organ-on-a-chip|heart-on-a-chip|microphysiological|microfluidic",
-        "tissue engineering": "tissue engineering|engineered tissue|3D scaffold|bioprinting|hydrogel",
-        "in vitro": "in vitro|cell culture|2D culture|monolayer|hiPSC|iPSC",
-        # Aging / senescence
-        "aging": "aging|aged|ageing|senescence|inflammaging|age-related|geroscience",
-        "senescence": "senescence|p21|p16|SASP|cellular senescence|replicative senescence",
-        "maturation": "maturation|adult-like|mature|differentiation|metabolic maturation",
-        # Disease / pathology
-        "fibrosis": "fibrosis|fibrotic|collagen deposition|scarring|TGF-beta|myofibroblast",
-        "hypertrophy": "hypertrophy|hypertrophic|cardiomegaly|cardiac remodeling",
-        "heart failure": "heart failure|HF|cardiac dysfunction|reduced ejection fraction|HFpEF|HFrEF",
-        "arrhythmia": "arrhythmia|arrhythmic|QT prolongation|torsades|proarrhythmia|triggered activity",
-        "ischemia": "ischemia|ischemic|myocardial infarction|MI|reperfusion|hypoxia",
-        # Electrophysiology / function
-        "electrophysiology": "electrophysiology|action potential|APD|field potential|FPD|calcium transient|patch clamp",
-        "action potential": "action potential|APD|action potential duration|voltage-sensitive dye",
-        "calcium": "calcium|Ca2+|calcium transient|calcium handling|SERCA|ryanodine",
-        "contractility": "contractility|force|twitch force|shortening|sarcomere|actomyosin",
-        "metabolism": "metabolism|metabolic|mitochondria|fatty acid oxidation|ATP|oxidative phosphorylation",
-        # Engineering interventions
-        "electrical stimulation": "electrical stimulation|pacing|electrical field stimulation|electrostimulation",
-        "mechanical": "mechanical loading|stretch|cyclic stretch|preload|afterload|mechanical stimulation",
-        "stiffness": "stiffness|substrate stiffness|matrix stiffness|Young's modulus|viscoelastic",
-        "co-culture": "co-culture|non-myocyte|fibroblast|endothelial|stromal|multicellular",
-        # Drug / toxicity
-        "drug": "drug|compound|small molecule|pharmacological|cardioactive|medication",
-        "toxicity": "cardiotoxicity|toxic|cytotoxic|adverse effect|safety pharmacology|hERG",
-        "screening": "drug screening|high-throughput|assay|compound library|phenotypic screen",
-        "prediction": "predict|predictive|translational|clinical relevance|in vivo correlation",
-        # Cancer / oncology
-        "cancer": "cancer|tumor|tumour|malignant|oncology|neoplasm|metastasis",
-        "chemotherapy": "chemotherapy|doxorubicin|anthracycline|checkpoint inhibitor|oncology cardiotoxicity",
-        # Neuroscience
-        "neuron": "neuron|neuronal|neural|axon|synapse|neuroscience|neuropathy",
-        "neurodegeneration": "neurodegeneration|Alzheimer|Parkinson|amyloid|tau|neuroinflammation",
-        # Respiratory
-        "lung": "lung|pulmonary|alveolar|respiratory|airway|COPD|asthma",
-        # Liver
-        "liver": "liver|hepatic|hepatocyte|NAFLD|NASH|hepatotoxicity|steatosis",
-        # Kidney
-        "kidney": "kidney|renal|nephron|podocyte|glomerular|nephrotoxicity",
-        # Inflammation / immune
-        "inflammation": "inflammation|inflammatory|cytokine|interleukin|TNF|NFkB|immune",
-        "immune": "immune|immunology|T cell|B cell|macrophage|innate immunity|adaptive immunity",
-        # Stem cells / iPSC
-        "iPSC": "iPSC|hiPSC|induced pluripotent|stem cell|pluripotent|reprogramming",
-        "differentiation": "differentiation|lineage|progenitor|committed|specification",
-        # Biomarker / omics
-        "biomarker": "biomarker|marker|indicator|prognostic|diagnostic|circulating",
-        "transcriptomics": "transcriptomics|RNA-seq|gene expression|single-cell|scRNA-seq|mRNA",
-        "proteomics": "proteomics|protein expression|mass spectrometry|phosphoproteomics",
-        "genomics": "genomics|genome|mutation|variant|GWAS|SNP|genetic",
-        # Clinical
-        "clinical": "clinical|patient|cohort|randomized|trial|outcome|mortality|morbidity",
-        "translation": "translational|clinical translation|bench to bedside|preclinical",
-    }
-
-    def _suggest_pattern(label: str, description: str) -> str:
-        """Return a pipe-separated regex suggestion based on label + description keywords."""
-        combined = (label + " " + description).lower()
-        # Score each lookup key by how many of its words appear in combined text
-        scores: list[tuple[int, str]] = []
-        for key, pattern in _PATTERN_LOOKUP.items():
-            key_words = re.split(r"[\s/]+", key)
-            score = sum(1 for w in key_words if w and w in combined)
-            if score:
-                scores.append((score, pattern))
-        if not scores:
-            # Fall back: extract non-trivial words from the label itself
-            stopwords = {"a","an","the","of","for","in","on","to","and","or","is","are","that","this","with","paper","study","describes","about","involves","measures","reports","shows"}
-            words = [w for w in re.split(r"[\s/\-,]+", combined) if len(w) > 2 and w not in stopwords]
-            return "|".join(dict.fromkeys(words[:6]))  # deduplicated, up to 6
-        scores.sort(key=lambda x: -x[0])
-        # Merge top patterns (up to 2 best matches)
-        seen: set[str] = set()
-        parts: list[str] = []
-        for _, pattern in scores[:2]:
-            for term in pattern.split("|"):
-                if term not in seen:
-                    seen.add(term)
-                    parts.append(term)
-        return "|".join(parts)
-
-    # Suggest button
+    # Suggest button — uses suggest_pattern imported from utils.gui_utils
     suggest_col, _ = st.columns([1, 3])
     with suggest_col:
         if st.button(
             "Suggest patterns from labels & descriptions",
-            help="For any tag with an empty pattern, generate a suggested pattern from its label and description.",
+            help="For any tag with an empty pattern, generates a suggestion from its label and description.",
         ):
             updated = st.session_state.tags_df.copy()
             pat_col = "Regex pattern (pipe = OR, case-insensitive)"
             for idx, row in updated.iterrows():
                 if not isinstance(row.get(pat_col), str) or not row[pat_col].strip():
-                    label = str(row.get("Tag label", ""))
-                    desc  = str(row.get("What it means", ""))
-                    updated.at[idx, pat_col] = _suggest_pattern(label, desc)
+                    updated.at[idx, pat_col] = suggest_pattern(
+                        str(row.get("Tag label", "")),
+                        str(row.get("What it means", "")),
+                    )
             st.session_state.tags_df = updated
             st.rerun()
 
@@ -722,16 +716,26 @@ with tab_table:
             grp.columns = ["Query group", "Papers"]
             st.dataframe(grp, use_container_width=True, hide_index=True)
 
-        with st.expander("Preview of papers kept for manual review — first 50"):
+        with st.expander("Preview of papers kept for manual review — first 50", expanded=True):
             display_cols = (
-                ["query_group", "title", "journal", "date"]
+                ["title", "abstract", "doi", "journal", "date", "query_group"]
                 + tag_cols_present
-                + ["keep_for_manual_screening"]
             )
             display_cols = [c for c in display_cols if c in screening.columns]
-            # Rename tag columns to human labels for readability
             preview = screening[display_cols].head(50).rename(columns=label_map)
-            st.dataframe(preview, use_container_width=True, hide_index=True)
+            st.dataframe(
+                preview,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "title":    st.column_config.TextColumn("Title",    width="large"),
+                    "abstract": st.column_config.TextColumn("Abstract", width="large"),
+                    "doi":      st.column_config.LinkColumn("DOI",      width="small",
+                                                            display_text=r"(.+)"),
+                    "journal":  st.column_config.TextColumn("Journal",  width="medium"),
+                    "date":     st.column_config.TextColumn("Date",     width="small"),
+                },
+            )
 
         st.divider()
         st.subheader("Download outputs")
@@ -766,7 +770,7 @@ with tab_table:
 with tab_figs:
     st.header("Figures")
 
-    # ── helper: render one figure card ────────────────────────────────────────
+    # ── helpers ────────────────────────────────────────────────────────────────
     def _figure_card(title: str, img_bytes: bytes, filename: str):
         st.markdown(f"#### {title}")
         st.image(img_bytes, use_container_width=True)
@@ -779,6 +783,13 @@ with tab_figs:
         )
         st.divider()
 
+    def _emit_fig(title: str, img_bytes: bytes, filename: str):
+        """Store figure in session state and render it."""
+        if "generated_figs" not in st.session_state:
+            st.session_state.generated_figs = []
+        st.session_state.generated_figs.append((title, img_bytes, filename))
+        _figure_card(title, img_bytes, filename)
+
     # ── REVIEW_GROUPS for figures (read from loaded query names) ──────────────
     REVIEW_GROUPS_FIG = list(REVIEW_PREFIXES)
 
@@ -789,19 +800,11 @@ with tab_figs:
         "#e377c2","#ff7f0e","#2ca02c","#9467bd","#1f77b4","#8c564b","#d62728","#7f7f7f",
     ]
 
-    # ── Show any figures already on disk ──────────────────────────────────────
     os.makedirs(IMAGES, exist_ok=True)
-    existing_pngs = sorted([
-        f for f in os.listdir(IMAGES)
-        if f.endswith(".png") and not f.startswith(".")
-    ])
-    if existing_pngs:
-        st.subheader(f"Figures from previous runs ({len(existing_pngs)} saved)")
-        for fname in existing_pngs:
-            fpath = os.path.join(IMAGES, fname)
-            with open(fpath, "rb") as fh:
-                img_bytes = fh.read()
-            _figure_card(fname.replace(".png", "").replace("_", " ").replace("#", ""), img_bytes, fname)
+    # Show only figures generated in the current session
+    if st.session_state.get("generated_figs"):
+        for fig_title, fig_bytes, fig_filename in st.session_state.generated_figs:
+            _figure_card(fig_title, fig_bytes, fig_filename)
         st.divider()
 
     # ── Figure selection & generation ─────────────────────────────────────────
@@ -831,6 +834,9 @@ with tab_figs:
     )
 
     if st.button("Generate selected figures", type="primary", use_container_width=True, disabled=not selected):
+        # Clear figures from any previous run so only the current run shows
+        st.session_state.generated_figs = []
+
         abs_json = os.path.join(ROOT, figs_json_dir.lstrip("./"))
         if not os.path.isdir(abs_json):
             abs_json = figs_json_dir
@@ -894,26 +900,67 @@ with tab_figs:
                     plt.tight_layout()
                     path = os.path.join(IMAGES, "#Papers_per_year.png")
                     fig.savefig(path, dpi=200, bbox_inches="tight")
-                    _figure_card("Papers per year", fig_to_png_bytes(fig), "papers_per_year.png")
+                    _emit_fig("Papers per year", fig_to_png_bytes(fig), "papers_per_year.png")
                     plt.close(fig)
                 except Exception as e:
                     st.error(f"papers_per_year: {e}")
 
-        # Venn / Euler
+        # Euler diagram (proportional — regions sized by actual overlap)
         if "euler" in selected:
-            with st.spinner("Generating query overlap diagram…"):
+            with st.spinner("Generating Euler diagram..."):
                 try:
+                    from matplotlib_venn import venn2, venn2_unweighted, venn3, venn3_unweighted
+
                     gdfs = load_raw_groups(abs_json)
-                    sets = {_short(g): set(df["title"].apply(normalize_title).dropna()) for g, df in gdfs.items()}
-                    fig, ax = plt.subplots(figsize=(12, 10))
-                    venn(sets, ax=ax, fontsize=11)
-                    ax.set_title("Query overlap — papers shared between groups\n(matched by title)", fontsize=13, fontweight="bold", pad=18)
-                    path = os.path.join(IMAGES, "Euler_Diagram.png")
-                    fig.savefig(path, dpi=200, bbox_inches="tight")
-                    _figure_card("Query overlap (Venn)", fig_to_png_bytes(fig), "Euler_Diagram.png")
-                    plt.close(fig)
+                    # Build sets keyed by short label; keep only non-empty
+                    sets: dict[str, set] = {
+                        _short(g): set(df["title"].apply(normalize_title).dropna())
+                        for g, df in gdfs.items()
+                        if "title" in df.columns and df["title"].notna().any()
+                    }
+                    sets = {k: v for k, v in sets.items() if v}
+                    n_sets = len(sets)
+
+                    if n_sets < 2:
+                        st.warning(
+                            f"Need at least 2 query groups with data to draw an Euler diagram. "
+                            f"Found {n_sets}. Run the scrape first."
+                        )
+                    else:
+                        labels = list(sets.keys())
+                        set_list = [sets[l] for l in labels]
+
+                        fig, ax = plt.subplots(figsize=(10, 8))
+
+                        if n_sets == 2:
+                            venn2(set_list, set_labels=labels, ax=ax)
+                        elif n_sets == 3:
+                            venn3(set_list, set_labels=labels, ax=ax)
+                        else:
+                            # For 4–6 sets matplotlib-venn doesn't support them;
+                            # fall back to the `venn` package (proportional layout)
+                            if n_sets > 6:
+                                # Keep 6 largest
+                                sets = dict(sorted(sets.items(), key=lambda x: -len(x[1]))[:6])
+                                st.info("Euler diagram supports up to 6 sets — showing the 6 largest groups.")
+                                plt.close(fig)
+                                fig, ax = plt.subplots(figsize=(14, 12))
+                            else:
+                                plt.close(fig)
+                                fig, ax = plt.subplots(figsize=(12, 10))
+                            venn(sets, ax=ax, fontsize=10)
+
+                        ax.set_title(
+                            "Euler diagram — paper overlap between query groups\n(matched by normalised title)",
+                            fontsize=13, fontweight="bold", pad=18,
+                        )
+                        plt.tight_layout()
+                        path = os.path.join(IMAGES, "Euler_Diagram.png")
+                        fig.savefig(path, dpi=200, bbox_inches="tight")
+                        _emit_fig("Euler diagram", fig_to_png_bytes(fig), "Euler_Diagram.png")
+                        plt.close(fig)
                 except Exception as e:
-                    st.error(f"euler: {e}")
+                    st.error(f"Could not generate Euler diagram: {e}")
 
         # Master-table based figures
         master_path = os.path.join(EXPORTED, "review_master.csv")
@@ -939,7 +986,7 @@ with tab_figs:
                         plt.tight_layout()
                         path = os.path.join(IMAGES, "total_papers_by_group.png")
                         fig.savefig(path, dpi=200, bbox_inches="tight")
-                        _figure_card("Total papers per query group", fig_to_png_bytes(fig), "total_papers_by_group.png")
+                        _emit_fig("Total papers per query group", fig_to_png_bytes(fig), "total_papers_by_group.png")
                         plt.close(fig)
 
                 if "tag_heatmap" in selected and tag_cols_m:
@@ -953,7 +1000,7 @@ with tab_figs:
                         plt.tight_layout()
                         path = os.path.join(IMAGES, "tag_cooccurrence_heatmap.png")
                         fig.savefig(path, dpi=200, bbox_inches="tight")
-                        _figure_card("Tag co-occurrence", fig_to_png_bytes(fig), "tag_cooccurrence_heatmap.png")
+                        _emit_fig("Tag co-occurrence", fig_to_png_bytes(fig), "tag_cooccurrence_heatmap.png")
                         plt.close(fig)
 
         st.success("Done. All generated figures are saved to `images/`.")

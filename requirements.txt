@@ -3,3 +3,8 @@ pandas
 openpyxl
 seaborn
 matplotlib
+matplotlib-venn
+venn
+streamlit
+pytest
+requests
