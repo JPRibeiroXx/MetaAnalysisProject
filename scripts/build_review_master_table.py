@@ -25,23 +25,46 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # ---------------------------------------------------------------------------
 TAG_PATTERNS = {
     "tag_model": (
-        r"engineered heart tissue|EHT|heart-on-a-chip|microphysiological"
-        r"|organoid|spheroid|hiPSC|iPSC-derived"
+        r"engineered heart tissue|engineered cardiac tissue|engineered myocardium"
+        r"|cardiac tissue engineering|cardiac microtissue|cardiac spheroid|cardiac organoid"
+        r"|heart organoid|heart-on-a-chip|heart on a chip|myocardium-on-a-chip"
+        r"|microphysiological system|organ-on-a-chip|organ on a chip|organs-on-chips"
+        r"|hiPSC-CM|iPSC-CM|hiPSC|iPSC|induced pluripotent.*cardiomyocyte"
+        r"|EHT"
     ),
     "tag_age": (
-        r"aging|aged|senescence|inflammaging|age-related|adult-like|maturation"
+        r"\baging\b|\baged\b|ageing|age-related|age-associated|senescen"
+        r"|SASP|inflammaging|progeroid|senolytic|premature aging|accelerated aging"
+    ),
+    "tag_maturation": (
+        r"\bmaturation\b|\bmature\b|adult-like|adultlike|adult phenotype"
+        r"|cardiomyocyte maturation|metabolic maturation|structural maturation"
+        r"|functional maturation|postnatal maturation"
     ),
     "tag_knob": (
-        r"pacing|electrical stimulation|mechanical loading|stretch"
-        r"|preload|afterload|stiffness|alignment|anisotropy|co-culture"
+        r"electrical stimulation|electrical pacing|\bpacing\b"
+        r"|mechanical loading|\bstretch\b|cyclic stretch"
+        r"|preload|afterload|mechanical stress"
+        r"|substrate stiffness|matrix stiffness|\bstiffness\b"
+        r"|alignment|anisotropy|micropattern|nanotopograph"
+        r"|perfusion|microfluidic|\bflow\b|shear stress"
+        r"|extracellular matrix|\bECM\b|decellularized"
+        r"|co-culture|coculture|tri-culture"
+        r"|bioreactor"
     ),
     "tag_endpoint": (
-        r"contractility|force|calcium|action potential|APD|arrhythmia"
-        r"|mitochondria|metabolism|fibrosis|ECM|beta-adrenergic|isoproterenol"
+        r"contractility|twitch force|\bforce\b|active tension|passive tension"
+        r"|electrophysiology|action potential|action potential duration|\bAPD\b"
+        r"|field potential duration|\bFPD\b|multi-electrode array|\bMEA\b"
+        r"|arrhythmia|proarrhythmia|QT prolongation|torsade"
+        r"|calcium transient|calcium handling|Ca2\+ transient"
+        r"|mitochondria|metabolism|oxidative phosphorylation|fatty acid oxidation"
+        r"|fibrosis|collagen|beta-adrenergic|adrenergic|isoproterenol"
     ),
     "tag_drug": (
-        r"cardiotoxicity|drug screening|proarrhythmia|QT|torsades"
-        r"|predict|translational"
+        r"cardiotoxicity|drug-induced cardiotoxicity|safety pharmacology|cardiac safety"
+        r"|proarrhythmia|QT prolongation|torsade|hERG|IKr"
+        r"|drug screening|toxicity testing|predictive toxicology"
     ),
 }
 
@@ -148,7 +171,7 @@ def apply_tags(df: pd.DataFrame) -> pd.DataFrame:
 
     df["keep_for_manual_screening"] = (
         df["tag_model"]
-        & df["tag_age"]
+        & (df["tag_age"] | df["tag_maturation"])
         & (df["tag_endpoint"] | df["tag_drug"] | df["tag_knob"])
     )
     return df
@@ -184,11 +207,9 @@ def main():
     review_prefixes = (
         "CORE_AGE_AGING_MODELS",
         "MATURATION_ADULTLIKE",
-        "ENGINEERING_KNOBS_BROAD",
-        "ENGINEERING_KNOBS_AGEFOCUSED",
-        "AGE_RELEVANT_ENDPOINTS_BROAD",
-        "AGE_RELEVANT_ENDPOINTS_AGEFOCUSED",
         "DRUG_PREDICTION_TOXICITY",
+        "ENGINEERING_KNOBS_AGEFOCUSED",
+        "AGE_RELEVANT_ENDPOINTS_AGEFOCUSED",
     )
 
     print(f"Loading JSONL files from: {args.json_dir}")

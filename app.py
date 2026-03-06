@@ -230,19 +230,20 @@ with tab_scrape:
                         placeholder="Block name",
                     )
                 with b_cols[1]:
-                    # Apply any pending chip addition BEFORE the textarea renders
-                    # so the widget picks up the updated value via the `value` parameter
+                    # Apply any pending chip addition BEFORE the textarea renders.
+                    # We update session_state for the textarea's key directly so the
+                    # widget itself shows the new term, not just the preview.
                     pending_key = f"qb_pending_{bid}"
-                    terms_key   = f"qb_terms_{bid}"
+                    terms_key = f"qb_terms_{bid}"
                     if pending_key in st.session_state:
                         term_to_add = st.session_state.pop(pending_key)
-                        block["terms"] = apply_pending_term(block["terms"], term_to_add)
-                        # Remove stale widget state so textarea re-renders with new value
-                        st.session_state.pop(terms_key, None)
+                        existing = st.session_state.get(terms_key, block["terms"])
+                        updated = apply_pending_term(existing, term_to_add)
+                        st.session_state[terms_key] = updated
+                        block["terms"] = updated
 
                     block["terms"] = st.text_area(
                         "Terms",
-                        value=block["terms"],
                         key=terms_key,
                         height=110,
                         help="One search term per line — all OR'd together. "
@@ -905,11 +906,11 @@ with tab_figs:
                 except Exception as e:
                     st.error(f"papers_per_year: {e}")
 
-        # Euler diagram (proportional — regions sized by actual overlap)
+        # Euler diagram (circle-style; clamp to top 3 groups)
         if "euler" in selected:
             with st.spinner("Generating Euler diagram..."):
                 try:
-                    from matplotlib_venn import venn2, venn2_unweighted, venn3, venn3_unweighted
+                    from matplotlib_venn import venn2, venn3
 
                     gdfs = load_raw_groups(abs_json)
                     # Build sets keyed by short label; keep only non-empty
@@ -927,28 +928,23 @@ with tab_figs:
                             f"Found {n_sets}. Run the scrape first."
                         )
                     else:
+                        # If more than 3 groups, keep the 3 largest so we always
+                        # get a clean circle-style Euler diagram instead of a
+                        # spiky polygon layout.
+                        if n_sets > 3:
+                            sets = dict(sorted(sets.items(), key=lambda x: -len(x[1]))[:3])
+                            st.info("Showing the 3 largest query groups in the Euler diagram.")
+
                         labels = list(sets.keys())
                         set_list = [sets[l] for l in labels]
 
                         fig, ax = plt.subplots(figsize=(10, 8))
 
-                        if n_sets == 2:
+                        if len(set_list) == 2:
                             venn2(set_list, set_labels=labels, ax=ax)
-                        elif n_sets == 3:
-                            venn3(set_list, set_labels=labels, ax=ax)
                         else:
-                            # For 4–6 sets matplotlib-venn doesn't support them;
-                            # fall back to the `venn` package (proportional layout)
-                            if n_sets > 6:
-                                # Keep 6 largest
-                                sets = dict(sorted(sets.items(), key=lambda x: -len(x[1]))[:6])
-                                st.info("Euler diagram supports up to 6 sets — showing the 6 largest groups.")
-                                plt.close(fig)
-                                fig, ax = plt.subplots(figsize=(14, 12))
-                            else:
-                                plt.close(fig)
-                                fig, ax = plt.subplots(figsize=(12, 10))
-                            venn(sets, ax=ax, fontsize=10)
+                            # len == 3 after clamping above
+                            venn3(set_list, set_labels=labels, ax=ax)
 
                         ax.set_title(
                             "Euler diagram — paper overlap between query groups\n(matched by normalised title)",
